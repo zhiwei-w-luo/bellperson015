@@ -3,27 +3,95 @@ use log::{debug, info, warn};
 use std::fs::File;
 use std::path::PathBuf;
 
+// Added by long C2 20210330
+use rust_gpu_tools::*;
+use std::thread;
+use std::time::Duration;
+
 const GPU_LOCK_NAME: &str = "bellman.gpu.lock";
 const PRIORITY_LOCK_NAME: &str = "bellman.priority.lock";
+
 fn tmp_path(filename: &str) -> PathBuf {
     let mut p = std::env::temp_dir();
     p.push(filename);
+    p
+}
+// Added by long 20210320
+fn gpu_lock_path(filename: &str, bus_id: u32) -> PathBuf {
+    let mut name = String::from(filename);
+    name.push('.');
+    name += &bus_id.to_string();
+    let mut p = std::env::temp_dir();
+    p.push(&name);
     p
 }
 
 /// `GPULock` prevents two kernel objects to be instantiated simultaneously.
 #[allow(clippy::upper_case_acronyms)]
 #[derive(Debug)]
-pub struct GPULock(File);
+// Modified by long 20210320
+// pub struct GPULock(File);
+// impl GPULock {
+//     pub fn lock() -> GPULock {
+//         let gpu_lock_file = tmp_path(GPU_LOCK_NAME);
+//         debug!("Acquiring GPU lock at {:?} ...", &gpu_lock_file);
+//         let f = File::create(&gpu_lock_file)
+//             .unwrap_or_else(|_| panic!("Cannot create GPU lock file at {:?}", &gpu_lock_file));
+//         f.lock_exclusive().unwrap();
+//         debug!("GPU lock acquired!");
+//         GPULock(f)
+//     }
+// }
+pub struct GPULock(File, u32);
 impl GPULock {
+    pub fn id(&self) -> u32 {
+        self.1
+    }
     pub fn lock() -> GPULock {
-        let gpu_lock_file = tmp_path(GPU_LOCK_NAME);
-        debug!("Acquiring GPU lock at {:?} ...", &gpu_lock_file);
-        let f = File::create(&gpu_lock_file)
-            .unwrap_or_else(|_| panic!("Cannot create GPU lock file at {:?}", &gpu_lock_file));
-        f.lock_exclusive().unwrap();
-        debug!("GPU lock acquired!");
-        GPULock(f)
+        let glock = gpu_lock_path(GPU_LOCK_NAME, 0);
+        let glock = File::create(&glock)
+            .unwrap_or_else(|_| panic!("Cannot create GPU glock file at {:?}", &glock));
+        loop {
+            glock.lock_exclusive().unwrap();
+            let devs = opencl::Device::all();
+            for dev in devs {
+                let id = dev.bus_id().unwrap();
+                let lock = gpu_lock_path(GPU_LOCK_NAME, id);
+                let lock = File::create(&lock)
+                    .unwrap_or_else(|_| panic!("Cannot create GPU lock file at {:?}", &lock));
+                if lock.try_lock_exclusive().is_ok() {
+                    return GPULock(lock, id);
+                }
+            }
+            glock.unlock().unwrap();
+            thread::sleep(Duration::from_secs(3));
+        }
+    }
+    pub fn lock_all() -> GPULock {
+        let glock = gpu_lock_path(GPU_LOCK_NAME, 0);
+        let glock = File::create(&glock)
+            .unwrap_or_else(|_| panic!("Cannot create GPU glock file at {:?}", &glock));
+        loop {
+            glock.lock_exclusive().unwrap();
+            let devs = opencl::Device::all();
+            let mut lock_cnt = 0;
+            let lock_num = devs.len();
+            for dev in devs {
+                let id = dev.bus_id().unwrap();
+                let lock = gpu_lock_path(GPU_LOCK_NAME, id);
+                let lock = File::create(&lock)
+                    .unwrap_or_else(|_| panic!("Cannot create GPU lock file at {:?}", &lock));
+                if lock.try_lock_exclusive().is_err() {
+                    break;
+                }
+                lock_cnt = lock_cnt + 1;
+            }
+            if lock_cnt == lock_num {
+                return GPULock(glock, 0);
+            }
+            glock.unlock().unwrap();
+            thread::sleep(Duration::from_secs(3));
+        }
     }
 }
 impl Drop for GPULock {
